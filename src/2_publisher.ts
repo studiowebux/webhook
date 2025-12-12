@@ -6,7 +6,7 @@ import type { WebhookJob } from "./libs/types.ts";
 import { CryptoService } from "./libs/crypto.ts";
 import { Logger } from "./libs/logger.ts";
 import { validatePublishRequest } from "./libs/validation.ts";
-import { getRetryConfig } from "./libs/retry.ts";
+import { getRetryConfig, delay } from "./libs/retry.ts";
 import { sendWebhook, getServerConfig } from "./libs/http.ts";
 
 const logger = new Logger("in-memory-publisher");
@@ -14,17 +14,23 @@ const crypto = new CryptoService("public_key.pem");
 const retryConfig = getRetryConfig();
 const serverConfig = getServerConfig();
 
+const MAX_QUEUE_SIZE = parseInt(Deno.env.get("MAX_QUEUE_SIZE") ?? "10000", 10);
 const queue: WebhookJob[] = [];
 const retryTimers = new Set<number>();
 let isShuttingDown = false;
 
-// Enqueue a job
-function enqueue(url: string, payload: unknown) {
+// Enqueue a job with backpressure
+function enqueue(url: string, payload: unknown): boolean {
+  if (queue.length >= MAX_QUEUE_SIZE) {
+    logger.warn("Queue full, rejecting job", { queueSize: queue.length, maxSize: MAX_QUEUE_SIZE });
+    return false;
+  }
   queue.push({ url, payload, attempt: 0, target: "customer-1" });
+  return true;
 }
 
 // Background job processor
-async function processQueue() {
+async function processQueue(): Promise<void> {
   while (!isShuttingDown) {
     const job = queue.shift();
     if (!job) {
@@ -58,12 +64,8 @@ async function processQueue() {
   logger.info("Queue processor stopped");
 }
 
-function delay(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 // Graceful shutdown handler
-async function shutdown() {
+async function shutdown(): Promise<void> {
   if (isShuttingDown) return;
 
   logger.info("Shutting down gracefully");
@@ -105,7 +107,11 @@ Deno.serve(serverConfig, async (req) => {
       const encryptedPayload = await crypto.encryptPayload(payload);
 
       logger.info("Publishing webhook", { url });
-      enqueue(url, encryptedPayload);
+      const enqueued = enqueue(url, encryptedPayload);
+
+      if (!enqueued) {
+        return new Response("Service unavailable: queue is full", { status: 503 });
+      }
 
       return new Response("Accepted", { status: 202 });
     } catch (e) {

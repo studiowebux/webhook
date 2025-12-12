@@ -1,3 +1,5 @@
+const MAX_PAYLOAD_SIZE = parseInt(Deno.env.get("MAX_PAYLOAD_SIZE") ?? "1048576", 10); // 1MB default
+
 export function isValidUrl(url: string): boolean {
   try {
     const parsed = new URL(url);
@@ -24,6 +26,14 @@ export function validatePublishRequest(body: unknown): {
 
   if (!payload) {
     return { valid: false, error: "'payload' is required" };
+  }
+
+  const payloadSize = JSON.stringify(payload).length;
+  if (payloadSize > MAX_PAYLOAD_SIZE) {
+    return {
+      valid: false,
+      error: `Payload size ${payloadSize} bytes exceeds maximum ${MAX_PAYLOAD_SIZE} bytes`,
+    };
   }
 
   return {

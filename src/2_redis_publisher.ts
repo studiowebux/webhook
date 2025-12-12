@@ -5,7 +5,7 @@ import type { WebhookJob } from "./libs/types.ts";
 import { CryptoService } from "./libs/crypto.ts";
 import { Logger } from "./libs/logger.ts";
 import { validatePublishRequest } from "./libs/validation.ts";
-import { getRetryConfig } from "./libs/retry.ts";
+import { getRetryConfig, delay } from "./libs/retry.ts";
 import { sendWebhook, getServerConfig } from "./libs/http.ts";
 
 const logger = new Logger("redis-publisher");
@@ -13,6 +13,7 @@ const crypto = new CryptoService("public_key.pem");
 const retryConfig = getRetryConfig();
 const serverConfig = getServerConfig();
 
+const MAX_QUEUE_SIZE = parseInt(Deno.env.get("MAX_QUEUE_SIZE") ?? "10000", 10);
 const redisUrl = Deno.env.get("REDIS_URL") ?? "redis://localhost:6379";
 const redis = createClient({ url: redisUrl });
 
@@ -21,13 +22,19 @@ await redis.connect();
 
 let isShuttingDown = false;
 
-// Enqueue a job
-async function enqueue(job: WebhookJob) {
+// Enqueue a job with backpressure
+async function enqueue(job: WebhookJob): Promise<boolean> {
+  const queueLength = await redis.lLen("webhookQueue");
+  if (queueLength >= MAX_QUEUE_SIZE) {
+    logger.warn("Queue full, rejecting job", { queueSize: queueLength, maxSize: MAX_QUEUE_SIZE });
+    return false;
+  }
   await redis.rPush("webhookQueue", JSON.stringify(job));
+  return true;
 }
 
 // Background job processor with blocking pop
-async function processQueue() {
+async function processQueue(): Promise<void> {
   while (!isShuttingDown) {
     try {
       const result = await redis.blPop("webhookQueue", 5);
@@ -69,12 +76,8 @@ async function processQueue() {
   logger.info("Queue processor stopped");
 }
 
-function delay(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 // Process delayed retries from sorted set
-async function processRetries() {
+async function processRetries(): Promise<void> {
   while (!isShuttingDown) {
     try {
       const now = Date.now();
@@ -97,7 +100,7 @@ async function processRetries() {
 }
 
 // Graceful shutdown handler
-async function shutdown() {
+async function shutdown(): Promise<void> {
   if (isShuttingDown) return;
 
   logger.info("Shutting down gracefully");
@@ -138,12 +141,16 @@ Deno.serve(serverConfig, async (req) => {
       const encryptedPayload = await crypto.encryptPayload(payload);
 
       logger.info("Publishing webhook", { url });
-      await enqueue({
+      const enqueued = await enqueue({
         url,
         payload: encryptedPayload,
         attempt: 0,
         target: "customer-1",
       });
+
+      if (!enqueued) {
+        return new Response("Service unavailable: queue is full", { status: 503 });
+      }
 
       return new Response("Accepted", { status: 202 });
     } catch (e) {

@@ -1,4 +1,5 @@
 import { type Consumer, Kafka, Partitioners, type Producer } from "kafkajs";
+import { Logger } from "./logger.ts";
 
 const KAFKA_BROKERS = Deno.env.get("KAFKA_BROKERS")?.split(",") ?? ["127.0.0.1:9092"];
 
@@ -20,8 +21,10 @@ export const kafkaAdmin: Kafka = new Kafka({
 export class PubSub {
   private producer: Producer;
   private consumer: Consumer;
+  private logger: Logger;
 
   constructor(groupId: string) {
+    this.logger = new Logger("kafka-pubsub");
     this.producer = kafkaProducer.producer({
       allowAutoTopicCreation: true,
       createPartitioner: Partitioners.DefaultPartitioner,
@@ -29,17 +32,17 @@ export class PubSub {
     this.consumer = kafkaConsumer.consumer({ groupId });
 
     this.producer.on("producer.connect", () => {
-      console.log("Kafka Producer connected");
+      this.logger.info("Kafka Producer connected");
     });
     this.producer.on("producer.disconnect", () => {
-      console.log("Kafka Producer disconnected");
+      this.logger.info("Kafka Producer disconnected");
     });
 
     this.consumer.on("consumer.connect", () => {
-      console.log("Kafka Consumer connected");
+      this.logger.info("Kafka Consumer connected");
     });
     this.consumer.on("consumer.disconnect", () => {
-      console.log("Kafka Consumer disconnected");
+      this.logger.info("Kafka Consumer disconnected");
     });
   }
 
@@ -52,7 +55,7 @@ export class PubSub {
     try {
       await this.producer.connect();
     } catch (e) {
-      console.error("Producer connection error:", e);
+      this.logger.error("Producer connection error", e);
       throw e;
     }
     return this;
@@ -66,7 +69,7 @@ export class PubSub {
         fromBeginning: true,
       });
     } catch (e) {
-      console.error("Consumer connection error:", e);
+      this.logger.error("Consumer connection error", e);
       throw e;
     }
     return this;
@@ -91,17 +94,16 @@ export class PubSub {
           partition,
           message,
           heartbeat,
-          _pause,
         }) => {
           if (!message?.value?.toString()) {
-            console.error("Received message with no payload");
+            this.logger.error("Received message with no payload");
             return;
           }
 
           try {
             await fn(message?.value?.toString(), { heartbeat });
           } catch (error) {
-            console.error("Failed to process message:", error);
+            this.logger.error("Failed to process message", error);
           } finally {
             await this.consumer.commitOffsets([
               {
@@ -114,7 +116,7 @@ export class PubSub {
         },
       });
     } catch (e) {
-      console.error("Consumer run error:", (e as Error).message);
+      this.logger.error("Consumer run error", e);
       throw e;
     }
   }

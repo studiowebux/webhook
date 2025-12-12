@@ -14,15 +14,22 @@ const serverConfig = getServerConfig();
 const pubSub = new PubSub("webhook");
 await pubSub.setupProducer();
 
-async function enqueue(job: WebhookJobWithId) {
-  await pubSub.sendMessage("events", [
-    { key: job.target, value: JSON.stringify(job) },
-  ]);
+// Note: Kafka provides built-in backpressure via producer config
+// maxInFlightRequests controls how many batches can be in flight
+async function enqueue(job: WebhookJobWithId): Promise<void> {
+  try {
+    await pubSub.sendMessage("events", [
+      { key: job.target, value: JSON.stringify(job) },
+    ]);
+  } catch (error) {
+    logger.error("Failed to enqueue message to Kafka", error);
+    throw error;
+  }
 }
 
 let id = 0;
 
-async function shutdown() {
+async function shutdown(): Promise<void> {
   logger.info("Shutting down gracefully");
   await pubSub.close();
   Deno.exit(0);
@@ -52,13 +59,19 @@ Deno.serve(serverConfig, async (req) => {
       const encryptedPayload = await crypto.encryptPayload(payload);
 
       logger.info("Publishing webhook to Kafka", { url, target });
-      await enqueue({
-        url,
-        payload: encryptedPayload,
-        attempt: 0,
-        target,
-        id: ++id,
-      });
+
+      try {
+        await enqueue({
+          url,
+          payload: encryptedPayload,
+          attempt: 0,
+          target,
+          id: ++id,
+        });
+      } catch (error) {
+        logger.error("Kafka producer error", error);
+        return new Response("Service unavailable: failed to publish to Kafka", { status: 503 });
+      }
 
       return new Response("Accepted", { status: 202 });
     } catch (e) {

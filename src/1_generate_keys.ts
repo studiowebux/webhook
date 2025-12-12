@@ -24,6 +24,6 @@ await Deno.writeTextFile(
   Buffer.from(publicKey).toString("base64"),
 );
 
-console.log("🔐 Keys generated and saved to disk:");
+console.log("Keys generated and saved to disk:");
 console.log(" - private_key.pem");
 console.log(" - public_key.pem");

@@ -3,7 +3,7 @@
 import { PubSub } from "./libs/kafka.ts";
 import type { WebhookJobWithId } from "./libs/types.ts";
 import { Logger } from "./libs/logger.ts";
-import { calculateBackoff } from "./libs/retry.ts";
+import { calculateBackoff, delay } from "./libs/retry.ts";
 import { sendWebhook } from "./libs/http.ts";
 
 const logger = new Logger("kafka-consumer");
@@ -12,7 +12,7 @@ const maxRetries = parseInt(Deno.env.get("MAX_RETRIES") ?? "5", 10);
 const pubSub = new PubSub("webhook");
 await pubSub.setupConsumer(["events"]);
 
-async function shutdown() {
+async function shutdown(): Promise<void> {
   logger.info("Shutting down gracefully");
   await pubSub.close();
   Deno.exit(0);
@@ -29,7 +29,7 @@ await pubSub.consume(
 async function process(
   message: string,
   { heartbeat }: { heartbeat: () => Promise<void> },
-) {
+): Promise<void> {
   const job: WebhookJobWithId = JSON.parse(message);
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -56,8 +56,4 @@ async function process(
       }
     }
   }
-}
-
-function delay(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
