@@ -1,33 +1,25 @@
 // deno run -A 2_redis_seq_publisher.ts
 
-import { publicEncrypt } from "node:crypto";
-import { Buffer } from "node:buffer";
 import { createClient } from "redis";
+import type { WebhookJob } from "./libs/types.ts";
+import { CryptoService } from "./libs/crypto.ts";
+import { Logger } from "./libs/logger.ts";
+import { validatePublishRequest } from "./libs/validation.ts";
+import { calculateBackoff } from "./libs/retry.ts";
+import { sendWebhook, getServerConfig } from "./libs/http.ts";
 
-type WebhookJob = {
-  url: string;
-  payload: unknown;
-  attempt: number;
-  target: string; // Customer id - can be an api key or any other secret shared with customer to identify which Public RSA Certificate to use
-};
+const logger = new Logger("redis-seq-publisher");
+const crypto = new CryptoService("public_key.pem");
+const serverConfig = getServerConfig();
+const maxRetries = parseInt(Deno.env.get("MAX_RETRIES") ?? "5", 10);
 
-const redis = createClient({
-  url: "redis://localhost:6379",
-});
-redis.on("error", (err) => console.error("Redis Client Error", err));
+const redisUrl = Deno.env.get("REDIS_URL") ?? "redis://localhost:6379";
+const redis = createClient({ url: redisUrl });
+
+redis.on("error", (err) => logger.error("Redis client error", err));
 await redis.connect();
 
 let isShuttingDown = false;
-
-// Cache public key in memory
-let publicKeyCache: string | null = null;
-async function getPublicKey(): Promise<string> {
-  if (!publicKeyCache) {
-    const publicKeyBase64 = await Deno.readTextFile("public_key.pem");
-    publicKeyCache = Buffer.from(publicKeyBase64, "base64").toString();
-  }
-  return publicKeyCache;
-}
 
 // Enqueue a job
 async function enqueue(job: WebhookJob) {
@@ -44,43 +36,33 @@ async function processQueue() {
         continue;
       }
 
-      const job = JSON.parse(result.element);
+      const job: WebhookJob = JSON.parse(result.element);
 
-      const maxRetries = 5;
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 30000);
-
-          const res = await fetch(job.url, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(job.payload),
-            signal: controller.signal,
-          });
-
-          clearTimeout(timeout);
+          const res = await sendWebhook(job.url, job.payload);
 
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
-          console.log(`SUCCESS: Webhook delivered on attempt ${attempt} for ${job.url}`);
+          logger.success("Webhook delivered", { url: job.url, attempt });
           break;
         } catch (err) {
-          console.warn(`WARNING: Attempt ${attempt} failed for ${job.url}:`, err.message);
+          logger.warn("Webhook delivery attempt failed", { url: job.url, attempt, error: (err as Error).message });
+
           if (attempt < maxRetries) {
-            const backoff = Math.pow(2, attempt) * 1000;
+            const backoff = calculateBackoff(attempt);
             await delay(backoff);
           } else {
-            console.error(`FAILED: Max retries reached for ${job.url}`);
+            logger.error("Max retries exhausted, moving to DLQ", undefined, { job });
             await redis.rPush("webhookDLQ", JSON.stringify(job));
           }
         }
       }
     } catch (err) {
-      console.error("Queue processing error:", err);
+      logger.error("Queue processing error", err);
       await delay(1000);
     }
   }
-  console.log("Queue processor stopped");
+  logger.info("Queue processor stopped");
 }
 
 function delay(ms: number) {
@@ -91,14 +73,14 @@ function delay(ms: number) {
 async function shutdown() {
   if (isShuttingDown) return;
 
-  console.log("\nShutting down gracefully...");
+  logger.info("Shutting down gracefully");
   isShuttingDown = true;
 
   await delay(100);
 
   const queueLength = await redis.lLen("webhookQueue");
   if (queueLength > 0) {
-    console.log(`WARNING: ${queueLength} jobs remaining in queue`);
+    logger.warn("Jobs remaining in queue", { queueLength });
   }
 
   await redis.quit();
@@ -108,57 +90,34 @@ async function shutdown() {
 Deno.addSignalListener("SIGINT", shutdown);
 Deno.addSignalListener("SIGTERM", shutdown);
 
-// Start the queue processor
 processQueue();
 
-// Validate webhook URL
-function isValidUrl(url: string): boolean {
-  try {
-    const parsed = new URL(url);
-    return parsed.protocol === "http:" || parsed.protocol === "https:";
-  } catch {
-    return false;
-  }
-}
-
-// Start HTTP server using official Deno.serve
-Deno.serve({ port: 4242, hostname: "0.0.0.0" }, async (req) => {
+Deno.serve(serverConfig, async (req) => {
   const { pathname } = new URL(req.url);
 
   if (req.method === "POST" && pathname === "/publish") {
     try {
       const body = await req.json();
-      const { url, payload } = body;
+      const validation = validatePublishRequest(body);
 
-      if (typeof url !== "string" || !isValidUrl(url)) {
-        return new Response("Invalid: 'url' must be a valid HTTP(S) URL", { status: 400 });
+      if (!validation.valid) {
+        return new Response(validation.error, { status: 400 });
       }
 
-      if (!payload) {
-        return new Response("Invalid: 'payload' is required", { status: 400 });
-      }
+      const { url, payload } = validation.data!;
+      const encryptedPayload = await crypto.encryptPayload(payload);
 
-      const publicKey = await getPublicKey();
-      const encryptedMessage = publicEncrypt(
-        publicKey,
-        JSON.stringify({
-          payload: payload,
-          timestamp: new Date().getTime(),
-        }),
-      );
-      const encryptedPayload = Buffer.from(encryptedMessage).toString("base64");
-
-      console.log("Encrypted Message (base64):", encryptedPayload);
-
+      logger.info("Publishing webhook", { url });
       await enqueue({
         url,
         payload: encryptedPayload,
         attempt: 0,
         target: "customer-1",
       });
+
       return new Response("Accepted", { status: 202 });
     } catch (e) {
-      console.error(e);
+      logger.error("Request processing failed", e);
       const errorMessage = e instanceof Error ? e.message : "Invalid request";
       return new Response(errorMessage, { status: 400 });
     }

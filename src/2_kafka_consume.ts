@@ -1,21 +1,19 @@
 // This file is ran by the provider, I guess it is an overkilled setup, but if you have a lot of customer, it might makes sens to have this kind of setup ?
 
 import { PubSub } from "./libs/kafka.ts";
+import type { WebhookJobWithId } from "./libs/types.ts";
+import { Logger } from "./libs/logger.ts";
+import { calculateBackoff } from "./libs/retry.ts";
+import { sendWebhook } from "./libs/http.ts";
 
-type WebhookJob = {
-  url: string;
-  payload: unknown;
-  attempt: number;
-  target: string; // Customer id - can be an api key or any other secret shared with customer to identify which Public RSA Certificate to use
-  id: number;
-};
+const logger = new Logger("kafka-consumer");
+const maxRetries = parseInt(Deno.env.get("MAX_RETRIES") ?? "5", 10);
 
 const pubSub = new PubSub("webhook");
 await pubSub.setupConsumer(["events"]);
 
-// Graceful shutdown
 async function shutdown() {
-  console.log("\nShutting down gracefully...");
+  logger.info("Shutting down gracefully");
   await pubSub.close();
   Deno.exit(0);
 }
@@ -32,42 +30,29 @@ async function process(
   message: string,
   { heartbeat }: { heartbeat: () => Promise<void> },
 ) {
-  const job: WebhookJob = JSON.parse(message);
-  const maxRetries = 5;
+  const job: WebhookJobWithId = JSON.parse(message);
+
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 30000);
-
-      const res = await fetch(job.url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(job.payload),
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeout);
+      const res = await sendWebhook(job.url, job.payload);
 
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      console.log(
-        `SUCCESS: Webhook delivered on attempt ${attempt}`,
-        `id: ${job.id}, target: ${job.target}`,
-      );
+      logger.success("Webhook delivered", { id: job.id, target: job.target, attempt });
       break;
     } catch (err) {
       if (attempt < maxRetries) {
         await heartbeat();
-        const backoff = Math.pow(2, attempt) * 1000;
-        console.warn(
-          `WARNING: Attempt ${attempt}, retry in ${backoff}ms`,
-          err.message,
-          `id: ${job.id}, target: ${job.target}`,
-        );
+        const backoff = calculateBackoff(attempt);
+        logger.warn("Webhook delivery attempt failed", {
+          id: job.id,
+          target: job.target,
+          attempt,
+          backoff,
+          error: (err as Error).message,
+        });
         await delay(backoff);
       } else {
-        console.error(
-          `FAILED: Max retries reached for job id: ${job.id}, target: ${job.target}`,
-        );
+        logger.error("Max retries exhausted", undefined, { id: job.id, target: job.target });
       }
     }
   }
