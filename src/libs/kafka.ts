@@ -1,23 +1,20 @@
-import { randomBytes } from "node:crypto";
 import { type Consumer, Kafka, Partitioners, type Producer } from "kafkajs";
 
-export function generateId(): string {
-  return randomBytes(33).toString("hex");
-}
+const KAFKA_BROKERS = Deno.env.get("KAFKA_BROKERS")?.split(",") ?? ["127.0.0.1:9092"];
 
 export const kafkaProducer: Kafka = new Kafka({
-  clientId: `${generateId()}-producer`,
-  brokers: ["127.0.0.1:9092"],
+  clientId: "webhook-producer",
+  brokers: KAFKA_BROKERS,
 });
 
 export const kafkaConsumer: Kafka = new Kafka({
-  clientId: `${generateId()}-consumer`,
-  brokers: ["127.0.0.1:9092"],
+  clientId: "webhook-consumer",
+  brokers: KAFKA_BROKERS,
 });
 
 export const kafkaAdmin: Kafka = new Kafka({
-  clientId: `${generateId()}-admin`,
-  brokers: ["127.0.0.1:9092"],
+  clientId: "webhook-admin",
+  brokers: KAFKA_BROKERS,
 });
 
 export class PubSub {
@@ -55,7 +52,8 @@ export class PubSub {
     try {
       await this.producer.connect();
     } catch (e) {
-      console.error("Producer error", e);
+      console.error("Producer connection error:", e);
+      throw e;
     }
     return this;
   }
@@ -68,7 +66,8 @@ export class PubSub {
         fromBeginning: true,
       });
     } catch (e) {
-      console.log("Consumer Error: ", e);
+      console.error("Consumer connection error:", e);
+      throw e;
     }
     return this;
   }
@@ -79,10 +78,13 @@ export class PubSub {
       { heartbeat }: { heartbeat: () => Promise<void> },
     ) => Promise<void>,
   ) {
+    const partitionsConcurrency = parseInt(Deno.env.get("PARTITIONS_CONCURRENCY") ?? "3", 10);
+    const sessionTimeout = parseInt(Deno.env.get("SESSION_TIMEOUT") ?? "90000", 10);
+
     try {
       await this.consumer.run({
-        partitionsConsumedConcurrently: 3,
-        sessionTimeout: 90_000,
+        partitionsConsumedConcurrently: partitionsConcurrency,
+        sessionTimeout: sessionTimeout,
         autoCommit: false,
         eachMessage: async ({
           topic,
@@ -92,17 +94,15 @@ export class PubSub {
           _pause,
         }) => {
           if (!message?.value?.toString()) {
-            throw new Error("No payload received");
+            console.error("Received message with no payload");
+            return;
           }
 
           try {
             await fn(message?.value?.toString(), { heartbeat });
-          } catch {
-            console.error("Failure to process the message.");
+          } catch (error) {
+            console.error("Failed to process message:", error);
           } finally {
-            // mark the message as processed after tried to process it (so this way if the consumer/server crashes it is gonna be retried)
-            // if: it was accepted by customer Server
-            // if: the message exhausted all retries (or move it in a DLQ)
             await this.consumer.commitOffsets([
               {
                 topic,
@@ -114,7 +114,8 @@ export class PubSub {
         },
       });
     } catch (e) {
-      console.log("Consumer Run Error: ", (e as Error).message);
+      console.error("Consumer run error:", (e as Error).message);
+      throw e;
     }
   }
 

@@ -24,7 +24,7 @@ function processMessage(req) {
       try {
         if (Math.random() < 0.2) {
           throw new ApiError(
-            "🚫 MOCK: Simulated an error on customer side, Force a retry",
+            "MOCK: Simulated error on customer side to force retry",
             "MOCK_ERROR",
             400,
           );
@@ -37,7 +37,7 @@ function processMessage(req) {
         );
         const plaintext = Buffer.from(decryptedMessage).toString();
 
-        console.log("📦 Received webhook payload:", plaintext);
+        console.log("Received webhook payload:", plaintext);
         span?.setStatus({
           code: SpanStatusCode.OK,
           message: "Webhook received!",
